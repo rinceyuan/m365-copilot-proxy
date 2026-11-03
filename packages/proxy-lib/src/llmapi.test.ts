@@ -450,6 +450,24 @@ describe("opt-in native backend", () => {
     expect(await res.text()).toBe(stream);
   });
 
+  it("forwards a client context-variant alias as the real model and keeps the rest of the body", async () => {
+    vi.stubEnv("M365_BACKEND", "llmapi");
+    const fetch = vi.fn().mockImplementation(async () => new Response('{"native":true}'));
+    vi.stubGlobal("fetch", fetch);
+    const app = createApp();
+    const native = { thinking: { type: "adaptive" }, output_config: { effort: "high" }, messages: [{ role: "user", content: "hi" }] };
+    for (const [requested, forwarded] of [
+      ["claude-opus-5.5@200k", "claude-opus-5.5"],
+      ["claude-opus-5.5@1M", "claude-opus-5.5"],
+      ["gpt-61-sol@400k", "gpt-61-sol"],
+      ["claude-opus-5.5@latest", "claude-opus-5.5@latest"],
+    ]) {
+      fetch.mockClear();
+      await app.fetch(request("/messages", { method: "POST", body: JSON.stringify({ model: requested, ...native }) }, "/v1"));
+      expect(JSON.parse(new TextDecoder().decode(fetch.mock.calls[0][1].body))).toEqual({ model: forwarded, ...native });
+    }
+  });
+
   it("uses an explicitly configured server token only for the selected standard backend", async () => {
     vi.stubEnv("M365_BACKEND", "llmapi");
     vi.stubEnv("M365_LLMAPI_TOKEN", "server-authorized");

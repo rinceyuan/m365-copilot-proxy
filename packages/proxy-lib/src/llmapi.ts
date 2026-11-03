@@ -25,6 +25,15 @@ const RESPONSE_HEADERS = [
   "x-clientcallid", "x-llm-api-version", "request-id",
 ];
 
+// Clients without a context-size picker (VS Code BYOK) can list one model several times as
+// "<model>@200k" etc. to offer different client-side context budgets. Only the suffix is
+// removed before forwarding; the context limit itself is enforced by the client.
+const CONTEXT_VARIANT = /^([A-Za-z0-9._:-]+)@\d{1,7}[km]$/i;
+
+export function upstreamModelId(model: string): string {
+  return CONTEXT_VARIANT.exec(model)?.[1] ?? model;
+}
+
 export interface LlmApiOptions {
   token?: string;
   clientMetadata?: Record<string, string>;
@@ -266,13 +275,17 @@ export async function handleLlmApiRequest(req: Request, options: LlmApiOptions =
       }
       const bytes = await readLimitedBody(req, route.limit);
       if (!bytes) return error(413, "body_too_large", "Request exceeds the LLMAPI route body limit.");
+      let parsed: Record<string, unknown>;
       try {
-        const parsed = JSON.parse(new TextDecoder().decode(bytes));
+        parsed = JSON.parse(new TextDecoder().decode(bytes));
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
       } catch {
         return error(400, "invalid_body", "Request body must be a JSON object.");
       }
-      body = bytes;
+      const model = typeof parsed.model === "string" ? upstreamModelId(parsed.model) : undefined;
+      body = model !== undefined && model !== parsed.model
+        ? new TextEncoder().encode(JSON.stringify({ ...parsed, model }))
+        : bytes;
       headers.set("Content-Type", "application/json");
     }
 

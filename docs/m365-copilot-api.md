@@ -155,6 +155,14 @@ For the tested Opus 5.5 route, omitted thinking and adaptive thinking succeeded;
 `thinking: {type: "disabled"}` was rejected with `invalid_body`. Do not infer
 that a `none` effort is supported from the five advertised effort levels.
 
+Clients without a context-size picker (VS Code BYOK Custom Endpoint) can list a
+model more than once with a context-variant suffix, for example
+`claude-opus-5.5@200k` or `claude-opus-5.5@1m`. Before forwarding, the native
+relay removes only a trailing `@<digits>k|m` from `model`. Other request fields
+are unchanged, and the upstream sees the real model ID. Requests without such a
+suffix are still forwarded byte-for-byte. The suffix is a client label: the
+client enforces its configured context budget, not the proxy or upstream.
+
 For an Anthropic SDK that appends `/v1/messages`, use the listener root as its
 base URL in selected native mode, or `/llmapi` for the independent relay.
 Do not append a second `/v1` through an OpenAI-style base URL.
