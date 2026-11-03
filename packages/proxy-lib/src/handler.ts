@@ -4,6 +4,8 @@ import {
   createLogger,
   trunc,
   getToneForModel,
+  getScenarioForModel,
+  getAvailableModels,
   requestUsesAgent,
   isPremiumOnlyModel,
   noteAgentRouteDead,
@@ -21,11 +23,12 @@ import {
   type MeteredBudget,
   meteredBudgetOf,
   priorityAccessFallbackModel,
-  PRIORITY_ACCESS_FALLBACK_ENV,
   couldBePriorityAccessPrefix,
   secondsUntilReset,
   type PriorityAccessExhaustion,
   formatMessages,
+  formatToolRuntimeContext,
+  formatToolChoiceInstruction,
   imageUrls,
   parseToolCalls,
   looksLikeConfabulation,
@@ -48,9 +51,13 @@ import {
   type ParseResult,
 } from "@m365-copilot/core";
 import { ChatCompletionRequest } from "./schemas.js";
-import type { z } from "zod/v4";
+import { z } from "zod/v4";
 
 const log = createLogger("handler");
+const FallbackModel = z.string().trim().refine(
+  (model) => getAvailableModels().includes(model) && !meteredBudgetOf(model),
+  "Fallback must be an advertised, unmetered model",
+).optional();
 
 // Render generated images (§14) as markdown so any OpenAI-compatible client shows
 // them inline. The artifact URL 401s without the designerappservice token, so we
@@ -154,6 +161,7 @@ interface ConversationState {
    *  Opus fallback, #18) can't continue the M365 conversation — it may need
    *  another scenario — so it starts a fresh one with the full history. */
   servedModel?: string;
+  unavailableModel?: string;
 }
 
 /**
@@ -226,6 +234,7 @@ export class SessionPool {
         existing.session.newConversation();
         existing.sentMessageCount = 0;
         existing.pendingNote = null;
+        existing.unavailableModel = undefined;
       }
       existing.lastAccessedAt = Date.now();
       return existing;
@@ -345,11 +354,23 @@ export function formatDeltaMessages(messages: ParsedMessage[], history: ParsedMe
 export async function handleChatCompletion(
   body: ChatBody,
   pool: SessionPool,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; fallbackModel?: string } = {},
 ): Promise<Response> {
+  const parsedFallback = FallbackModel.safeParse(opts.fallbackModel);
+  if (!parsedFallback.success) {
+    return jsonResponse(400, { error: {
+      message: parsedFallback.error.message, type: "invalid_request_error", param: "X-M365-Fallback-Model",
+    } });
+  }
+  const candidate = parsedFallback.data;
+  const clientFallback = candidate && (
+    getToneForModel(candidate) !== getToneForModel(body.model) ||
+    getScenarioForModel(candidate).scenario !== getScenarioForModel(body.model).scenario
+  ) ? candidate : null;
   const conv = pool.resolve(body.messages, body.tools);
   const { session } = conv;
   const hasTools = body.tools && body.tools.length > 0 && body.tool_choice !== "none";
+  const toolContext = hasTools ? formatToolRuntimeContext(body.tools!) : "";
   const requestedModel = body.model;
 
   // Priority access (§15, §24 F55, §26, issue #18). Once a budget is used up
@@ -361,13 +382,21 @@ export async function handleChatCompletion(
   // counts.
   const requestedBudget = meteredBudgetOf(requestedModel);
   const knownExhaustion = activePriorityAccessExhaustion(requestedBudget ?? requestedModel);
-  const fallbackModel = knownExhaustion && requestedBudget ? priorityAccessFallbackModel(requestedBudget) : null;
+  const fallbackModel = knownExhaustion
+    ? clientFallback ?? (requestedBudget ? priorityAccessFallbackModel(requestedBudget) : null)
+    : null;
   if (knownExhaustion && !fallbackModel) {
     log.info(`Priority access exhausted (${knownExhaustion.window}) until ${knownExhaustion.resetsAt.toISOString()} — 429 without contacting M365`);
     return priorityAccessResponse(knownExhaustion, requestedModel);
   }
-  let model = fallbackModel ?? requestedModel;
-  if (fallbackModel) log.info(`Priority access exhausted until ${knownExhaustion!.resetsAt.toISOString()} — serving ${requestedModel} with ${fallbackModel} (${PRIORITY_ACCESS_FALLBACK_ENV[requestedBudget!]})`);
+  const unavailableFallback = conv.unavailableModel === requestedModel && conv.servedModel === clientFallback
+    ? clientFallback : null;
+  if (!unavailableFallback) conv.unavailableModel = undefined;
+  let model = fallbackModel ?? unavailableFallback ?? requestedModel;
+  let fallbackReason = unavailableFallback && !fallbackModel
+    ? "the requested model was unavailable in this conversation"
+    : "the requested model's priority-access quota is exhausted";
+  if (fallbackModel) log.info(`Priority access exhausted until ${knownExhaustion!.resetsAt.toISOString()} — serving ${requestedModel} with ${fallbackModel}`);
   if (conv.servedModel && conv.servedModel !== model) {
     // The conversation was being served by another model (e.g. Opus 5.5 before
     // the fallback): continue in a fresh M365 conversation with the full history.
@@ -466,9 +495,22 @@ export async function handleChatCompletion(
     let agentRefreshed = false;
     let disengageRetried = false;
     let agentFallbackDone = false;
-    let priorityFallbackDone = false;
+    let fallbackDone = model !== requestedModel;
     let internalErrorFreshRetried = false;
     let originalText = text;
+    function switchToFallback(fallback: string, reason: string) {
+      fallbackDone = true;
+      fallbackReason = reason;
+      log.info(`${model}: ${reason} — re-sending to ${fallback} in a fresh conversation`);
+      model = fallback;
+      tone = getToneForModel(model);
+      framingVariant = currentFramingVariant(defaultFramingForModel(model));
+      useToolAgent = requestUsesAgent(model, !!hasTools);
+      session.newConversation();
+      text = formatMessages(body.messages, body.tools, body.tool_choice, session.conversationId, framingVariant);
+      inputImages = imageUrls(body.messages);
+      originalText = text;
+    }
     // Self-imposed pacing while the account is degraded (thread-rate throttle). A
     // no-op when healthy; during backoff it sleeps a jittered delay so we stop
     // starting fresh turns into the throttle and let it self-heal (H-R1). This
@@ -506,7 +548,11 @@ export async function handleChatCompletion(
         // The agent overrides `tone` (forces GPT-5), so tool-less requests must
         // skip it to reach the model the tone selects (e.g. Claude). See
         // ModelSession.run / docs H8.6.
-        copilotStream = await session.run(text, model, signal, useToolAgent, inputImages, waitForBudget);
+        const routingNote = model !== requestedModel
+          ? `\n\nProxy routing metadata: requested_model=${requestedModel}; served_model=${model}. The proxy is using the configured fallback because ${fallbackReason}.`
+          : "";
+        const prompt = `${text}${routingNote}${toolContext ? `\n\n${toolContext}${formatToolChoiceInstruction(body.tool_choice)}` : ""}`;
+        copilotStream = await session.run(prompt, model, signal, useToolAgent, inputImages, waitForBudget);
       } catch (err: any) {
         if (err instanceof TurnBudgetHold) return { error: turnBudgetHoldResponse(err) };
         return { error: jsonResponse(502, { error: { message: err.message, type: "upstream_error" } }) };
@@ -616,24 +662,29 @@ export async function handleChatCompletion(
       if (exhausted) {
         const budget = meteredBudgetOf(model);
         if (budget || copilotStream.result?.value === "OutOfCredits") notePriorityAccessExhausted(budget ?? model, exhausted);
-        const fallback = budget && !priorityFallbackDone ? priorityAccessFallbackModel(budget) : null;
+        const fallback = !fallbackDone && (budget || copilotStream.result?.value === "OutOfCredits")
+          ? clientFallback ?? (budget ? priorityAccessFallbackModel(budget) : null) : null;
         if (fallback) {
-          priorityFallbackDone = true;
-          log.info(`Priority access exhausted (${exhausted.window}) — re-sending to ${fallback} (${PRIORITY_ACCESS_FALLBACK_ENV[budget!]}) in a fresh conversation`);
-          model = fallback;
-          tone = getToneForModel(model);
-          framingVariant = currentFramingVariant(defaultFramingForModel(model));
-          useToolAgent = requestUsesAgent(model, !!hasTools);
-          session.newConversation();
-          text = formatMessages(body.messages, body.tools, body.tool_choice, session.conversationId, framingVariant);
-          inputImages = imageUrls(body.messages);
-          originalText = text;
+          switchToFallback(fallback, "the requested model's priority-access quota is exhausted");
           attempt--;
           continue;
         }
         noteRequestOutcome(false, convId); // an answer, not a throttle
         log.info(`Priority access exhausted (${exhausted.window}) — resets ${exhausted.resetsAt.toISOString()}`);
         return { error: priorityAccessResponse(exhausted, model) };
+      }
+
+      if (
+        clientFallback && !fallbackDone && isPremiumOnlyModel(model) &&
+        copilotStream.result?.value === "InternalError" &&
+        copilotStream.messageType !== "Disengaged" &&
+        !copilotStream.hasContent && fullText.length === 0 &&
+        !(copilotStream.throttle && copilotStream.throttle.current >= copilotStream.throttle.max)
+      ) {
+        conv.unavailableModel = requestedModel;
+        switchToFallback(clientFallback, "the requested model returned an empty InternalError");
+        attempt--;
+        continue;
       }
 
       if (copilotStream.hasContent || fullText.length > 0) {
@@ -953,7 +1004,7 @@ export async function handleChatCompletion(
     async start(controller) {
       const enc = new TextEncoder();
       const send = (obj: unknown) => controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
-      const base = { id: completionId, object: "chat.completion.chunk", created, model };
+      const base = { id: completionId, object: "chat.completion.chunk", created, get model() { return model; } };
       send({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
       // Keepalive: a REAL empty-delta chunk, not an SSE comment. Agents that track
       // stream liveness by data chunks (e.g. Hermes: comments don't reset its

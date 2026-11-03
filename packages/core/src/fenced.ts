@@ -73,7 +73,7 @@ const SHELL_LANGS = new Set([
 ]);
 // A tool counts as "the shell" if its name looks like a run-a-command tool. pi
 // uses `bash`, opencode `bash`, hermes `shell`/`run`, openclaw `run_command` — all caught.
-const SHELL_TOOL_NAME = /^(bash|sh|shell|zsh|run|exec|execute|command|cmd|terminal|run_command|run_terminal_cmd|execute_command|execute_bash|shell_exec|system)$/i;
+const SHELL_TOOL_NAME = /^(bash|sh|shell|zsh|powershell|pwsh|run|exec|execute|command|cmd|terminal|run_command|run_terminal_cmd|execute_command|execute_bash|shell_exec|system)$/i;
 
 const WRITE_PATH_PARAM = /^(path|file_path|filepath|filename|file)$/i;
 const WRITE_CONTENT_PARAM = /^(content|contents|text|body)$/i;
@@ -167,6 +167,7 @@ export function findShellTool(tools: ToolDef[]): ToolDef | undefined {
 export interface FencedToolSpec {
   name: string;
   description?: string;
+  requiredParams?: string[];
   /** Declared JSON-Schema `type` per param, for coercing header values. */
   parameterTypes: Record<string, string>;
   /** Scalar params rendered as `key: value` header lines. */
@@ -181,6 +182,7 @@ export interface FencedToolSpec {
 export function deriveFencedSpec(tool: ToolDef): FencedToolSpec {
   const name = tool.function.name;
   const description = tool.function.description;
+  const requiredParams = tool.function.parameters?.required ?? [];
   const propsSchema = tool.function.parameters?.properties ?? {};
   const props = Object.keys(propsSchema);
 
@@ -197,6 +199,7 @@ export function deriveFencedSpec(tool: ToolDef): FencedToolSpec {
     return {
       name,
       description,
+      requiredParams,
       parameterTypes,
       editPair: { search, replace },
       headerParams: props.filter((p) => p !== search && p !== replace),
@@ -209,6 +212,7 @@ export function deriveFencedSpec(tool: ToolDef): FencedToolSpec {
   return {
     name,
     description,
+    requiredParams,
     parameterTypes,
     bodyParam,
     headerParams: props.filter((p) => p !== bodyParam),
@@ -275,7 +279,38 @@ function renderFencedTemplate(spec: FencedToolSpec): string {
     lines.push(`<${spec.bodyParam}>`);
   }
   const header = spec.description ? `${spec.name} — ${spec.description}` : spec.name;
-  return `${header}\n\`\`\`${spec.name}\n${lines.join("\n")}\n\`\`\``;
+  const required = spec.requiredParams?.length ? `\nRequired arguments: ${spec.requiredParams.join(", ")}.` : "";
+  return `${header}${required}\n\`\`\`${spec.name}\n${lines.join("\n")}\n\`\`\``;
+}
+
+const COMPLETION_INSTRUCTION =
+  "When the requested work and checks are complete, send the verified result in a ```task_complete block, not a plain closing sentence. Do not call it while requested work remains unfinished or checks have failed.";
+
+function finalReplyInstruction(tools: ToolDef[]): string {
+  return tools.some((tool) => tool.function.name === "task_complete")
+    ? COMPLETION_INSTRUCTION
+    : "When the task is complete, tell me in a sentence instead of sending a block.";
+}
+
+/** Keep Copilot's local tools distinct from identically named M365 sandbox tools. */
+export function formatToolRuntimeContext(tools: ToolDef[]): string {
+  const complete = tools.find((tool) => tool.function.name === "task_complete");
+  if (!complete) return "";
+  const view = tools.find((tool) => tool.function.name === "view");
+  const viewNote = view
+    ? " A built-in sandbox view cannot read my terminal's files. For the terminal's view tool, send the fenced view block shown below instead of calling the built-in view."
+    : "";
+  const examples = (view ? [view, complete] : [complete])
+    .map((tool) => renderFencedTemplate(deriveFencedSpec(tool))).join("\n\n");
+  return `<harness_tool_context>
+The tools below belong to my terminal, not your M365 cloud sandbox. Request them with fenced blocks; my terminal executes them subject to its normal permission and path checks.${viewNote}
+
+Available terminal tools in this request: ${tools.map((tool) => tool.function.name).join(", ")}.
+
+${COMPLETION_INSTRUCTION}
+
+${examples}
+</harness_tool_context>`;
 }
 
 /** The fenced equivalent of formatToolDefinitions' <tools> block.
@@ -874,7 +909,7 @@ ${toolsBlock(tools)}`;
     const lang = findShellTool(tools) ? "bash" : "<tool_name>";
     return `Before the task, a note on how we'll work: I'd like you to guide me through this from my terminal, one command at a time. Please don't use your own sandbox tools (${BUILT_IN_SANDBOX}) — that's a separate cloud machine (${SANDBOX_PATHS}) and my project isn't on it.
 
-Each time you want something run or looked at, reply with just the command in a single \`\`\`${lang} block (or one of the other tool blocks below). I'll run it in my project directory right away and paste the real output back to you as a <tool_response>. The files the task mentions are already there, so it's best to start by looking at them. When the task is complete, tell me in a sentence instead of sending a block.
+Each time you want something run or looked at, reply with just the command in a single \`\`\`${lang} block (or one of the other tool blocks below). I'll run it in my project directory right away and paste the real output back to you as a <tool_response>. The files the task mentions are already there, so it's best to start by looking at them. ${finalReplyInstruction(tools)}
 
 ${toolsBlock(tools)}`;
   },
@@ -892,7 +927,7 @@ ${toolsBlock(tools)}`;
     if (!findShellTool(tools)) return FRAMING_VARIANTS.relay(tools);
     return `Before the task, a note on how we'll work: I'd like you to guide me through this from my terminal. Please don't use your own sandbox tools (${BUILT_IN_SANDBOX}) — that's a separate cloud machine (${SANDBOX_PATHS}) and my project isn't on it.
 
-Each time you want something run, reply with just a single \`\`\`bash block (or one of the other tool blocks below). I'll run it in my project directory right away and paste the real output back to you as a <tool_response>. Each round trip takes me a while, so put as much as you can into one block: a script can look at the files, make the change and check the result all at once. The files the task mentions are already there. When the task is complete, tell me in a sentence instead of sending a block.
+Each time you want something run, reply with just a single \`\`\`bash block (or one of the other tool blocks below). I'll run it in my project directory right away and paste the real output back to you as a <tool_response>. Each round trip takes me a while, so put as much as you can into one block: a script can look at the files, make the change and check the result all at once. The files the task mentions are already there. ${finalReplyInstruction(tools)}
 
 ${toolsBlock(tools)}`;
   },
@@ -1314,17 +1349,18 @@ function parseFencedInner(spec: FencedToolSpec, inner: string): Record<string, u
   // line and lost `newString` below it. Header-only fences without such lines
   // read as before (47 of 47 pi `read` fences in the dumps).
   const headerOnly = !spec.editPair && spec.bodyParam === undefined;
+  const namedShellBody = !!spec.bodyParam && SHELL_TOOL_NAME.test(spec.name);
   let open: { key: string; inline: string; more: string[] } | null = null;
   const closeOpen = () => {
     if (open?.more.length) args[open.key] = headerTextValue(open.inline, open.more);
     open = null;
   };
   let i = 0;
-  if (spec.headerParams.length) {
+  if (spec.headerParams.length || namedShellBody) {
     for (; i < lines.length; i++) {
       const line = lines[i];
       const m = line.match(/^([A-Za-z0-9_]+):[ \t]?(.*)$/);
-      if (m && spec.headerParams.includes(m[1])) {
+      if (m && (spec.headerParams.includes(m[1]) || (namedShellBody && m[1] === spec.bodyParam))) {
         closeOpen();
         const key = m[1];
         const type = spec.parameterTypes[key];
@@ -1338,7 +1374,9 @@ function parseFencedInner(spec: FencedToolSpec, inner: string): Record<string, u
           }
         }
         args[key] = coerceHeaderValue(m[2].trim(), type);
-        if (headerOnly && (type ?? "string") === "string") open = { key, inline: m[2].trim(), more: [] };
+        if ((headerOnly || key === spec.bodyParam) && (type ?? "string") === "string") {
+          open = { key, inline: m[2].trim(), more: [] };
+        }
       } else if (open) {
         open.more.push(line);
       } else if (line.trim() === "") {
@@ -1362,7 +1400,10 @@ function parseFencedInner(spec: FencedToolSpec, inner: string): Record<string, u
     args[spec.editPair.search] = sr[1];
     args[spec.editPair.replace] = sr[2];
   } else if (spec.bodyParam !== undefined) {
-    args[spec.bodyParam] = rest;
+    const namedBody = args[spec.bodyParam];
+    args[spec.bodyParam] = typeof namedBody === "string"
+      ? [namedBody, rest].filter((part) => part.length > 0).join("\n")
+      : rest;
   }
 
   return args;

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Replace core's ModelSession with a scripted fake so we can exercise the handler's
 // streaming path with no auth/WebSocket. Everything else in core stays real.
@@ -100,7 +100,7 @@ vi.mock("@m365-copilot/core", async (importActual) => {
 /** Which fake ModelSession (by creation order) served every run() call, in order. */
 const servedBy: number[] = [];
 
-const { handleChatCompletion, SessionPool, ChatCompletionRequest } = await import("./index.js");
+const { handleChatCompletion, SessionPool, ChatCompletionRequest, createApp } = await import("./index.js");
 const { resetAgentRoutes, resetPriorityAccessState, TurnBudgetHold } = await import("@m365-copilot/core");
 
 // The proxy remembers a priority-access wall for the process (until the reset);
@@ -110,10 +110,13 @@ afterEach(() => resetPriorityAccessState());
 /** One request on a fresh pool with a fake clock: an empty upstream turn makes
  *  the handler wait 2 s before each quick retry, and that wait is the handler's
  *  own pacing, not what these tests check. */
-async function respond(body: ReturnType<typeof ChatCompletionRequest.parse>): Promise<Response> {
+async function respond(
+  body: ReturnType<typeof ChatCompletionRequest.parse>,
+  opts: Parameters<typeof handleChatCompletion>[2] = {},
+): Promise<Response> {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   try {
-    const pending = handleChatCompletion(body, new SessionPool());
+    const pending = handleChatCompletion(body, new SessionPool(), opts);
     await vi.runAllTimersAsync();
     return await pending;
   } finally {
@@ -757,6 +760,82 @@ describe("follow-up turns and give-ups (Windows / pi, measured)", () => {
   });
 });
 
+describe("Copilot terminal tools and completion", () => {
+  const tools = [
+    { type: "function", function: { name: "view", parameters: {
+      type: "object", properties: { path: { type: "string" }, view_range: { type: "array", items: { type: "integer" } } },
+      required: ["path"],
+    } } },
+    { type: "function", function: { name: "powershell", parameters: {
+      type: "object", properties: { command: { type: "string" }, description: { type: "string" } },
+      required: ["command", "description"],
+    } } },
+    { type: "function", function: { name: "task_complete", parameters: {
+      type: "object", properties: { summary: { type: "string" } }, required: ["summary"],
+    } } },
+  ];
+  async function ask(messages: any[], pool: InstanceType<typeof SessionPool>, tool_choice?: any) {
+    const res = await handleChatCompletion(ChatCompletionRequest.parse({
+      model: "claude-sonnet-4.6", stream: false, tools, messages, tool_choice,
+    }), pool);
+    expect(res.status).toBe(200);
+    return (await res.json()).choices[0].message;
+  }
+
+  it("preserves the local tool inventory and completion contract on full, delta, and refusal-retry turns", async () => {
+    scripted.result = null;
+    scripted.texts = [];
+    scripted.queue = [
+      { fullText: "```view\npath: C:\\probe\\nonce.txt\n```" },
+      { fullText: "I can't access your local files from here." },
+      { fullText: "```task_complete\nVerified the nonce: LOCAL_NONCE.\n```" },
+    ];
+    const pool = new SessionPool();
+    const messages: any[] = [{ role: "user", content: "Inspect the local nonce." }];
+    const first = await ask(messages, pool, { type: "function", function: { name: "view" } });
+    expect(first.tool_calls[0].function.name).toBe("view");
+    expect(scripted.texts[0]).toMatch(/You MUST call "view"\.\s*$/);
+    messages.push({ role: "assistant", content: null, tool_calls: first.tool_calls });
+    messages.push({ role: "tool", tool_call_id: first.tool_calls[0].id, content: "LOCAL_NONCE" });
+    const final = await ask(messages, pool);
+    expect(final.tool_calls[0].function.name).toBe("task_complete");
+    expect(JSON.parse(final.tool_calls[0].function.arguments).summary).toContain("LOCAL_NONCE");
+    expect(scripted.texts).toHaveLength(3);
+    for (const text of scripted.texts) {
+      expect(text).toContain("<harness_tool_context>");
+      expect(text).toContain("Available terminal tools in this request: view, powershell, task_complete.");
+      expect(text).toContain("```view");
+      expect(text).toContain("```task_complete");
+      expect(text).toContain("normal permission and path checks");
+    }
+    expect(scripted.texts[1]).toContain('<tool_response tool="view"');
+    expect(scripted.texts[1]).not.toContain("Inspect the local nonce.");
+    scripted.queue = [];
+  });
+
+  it("does not advertise local execution or completion when tools are disabled", async () => {
+    scripted.result = null;
+    scripted.texts = [];
+    scripted.queue = [{ fullText: "OK" }];
+    const message = await ask([{ role: "user", content: "Reply OK without tools." }], new SessionPool(), "none");
+    expect(message.tool_calls).toBeUndefined();
+    expect(scripted.texts[0]).not.toContain("<harness_tool_context>");
+    expect(scripted.texts[0]).not.toContain("```task_complete");
+    scripted.queue = [];
+  });
+
+  it("never fabricates task_complete from a plain-text completion", async () => {
+    scripted.result = null;
+    scripted.texts = [];
+    scripted.queue = [{ fullText: "The result is 2." }];
+    const message = await ask([{ role: "user", content: "What is 1 + 1?" }], new SessionPool());
+    expect(message.tool_calls).toBeUndefined();
+    expect(message.content).toBe("The result is 2.");
+    expect(scripted.texts).toHaveLength(1);
+    scripted.queue = [];
+  });
+});
+
 describe("a new harness session that shares the first user message", () => {
   const tools = [{ type: "function", function: { name: "bash", parameters: { type: "object", properties: { command: { type: "string" } } } } }];
   const ask = async (messages: any[], pool: InstanceType<typeof SessionPool>) =>
@@ -1010,6 +1089,56 @@ describe("Priority access (Opus 5.5, Sonnet 5.5): OutOfCredits, remembering it, 
     expect(scripted.models).toEqual(["claude-opus-4.8"]);
   });
 
+  it("reports Sonnet rather than the exhausted Opus in fallback SSE tool chunks", async () => {
+    process.env.M365_OPUS_FALLBACK_MODEL = "claude-sonnet-4.6";
+    scripted.queue = [REFUSAL, { fullText: "```bash\nls\n```" }];
+    const res = await send("claude-opus-5.5", "inspect the files", true);
+    const chunks = (await res.text()).split("\n")
+      .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+      .map((line) => JSON.parse(line.slice(6)));
+    const calls = chunks.filter((chunk) => chunk.choices?.[0]?.delta?.tool_calls);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].model).toBe("claude-sonnet-4.6");
+    expect(scripted.models).toEqual(["claude-opus-5.5", "claude-sonnet-4.6"]);
+    expect(scripted.agentFlags).toEqual([true, false]);
+    expect(scripted.texts[1]).toContain("requested_model=claude-opus-5.5; served_model=claude-sonnet-4.6");
+  });
+
+  it("returns an ongoing fallback session to the requested Opus model after the daily reset", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-11-02T23:59:59Z"));
+      process.env.M365_OPUS_FALLBACK_MODEL = "claude-sonnet-4.6";
+      const daily = WEEKLY.replace("for the week", "for today").replace("until Monday", "until tomorrow");
+      scripted.queue = [
+        { fullText: daily, result: { value: "OutOfCredits", message: daily } },
+        { fullText: "```bash\nls\n```" },
+      ];
+      const first = await (await send("claude-opus-5.5", "long task")).json();
+      expect(first.model).toBe("claude-sonnet-4.6");
+      vi.setSystemTime(new Date("2026-11-03T00:00:01Z"));
+      scripted.queue = [{ fullText: "```bash\npwd\n```" }];
+      scripted.models = [];
+      scripted.newConversations = 0;
+      const res = await handleChatCompletion(ChatCompletionRequest.parse({
+        model: "claude-opus-5.5", stream: false, tools,
+        messages: [
+          { role: "system", content: "sys" }, { role: "user", content: "long task" },
+          { role: "assistant", content: null, tool_calls: first.choices[0].message.tool_calls },
+          { role: "tool", tool_call_id: first.choices[0].message.tool_calls[0].id, content: "a.txt" },
+        ],
+      }), pool);
+      expect(res.status).toBe(200);
+      expect((await res.json()).model).toBe("claude-opus-5.5");
+      expect(scripted.models).toEqual(["claude-opus-5.5"]);
+      expect(scripted.newConversations).toBe(1);
+      expect(scripted.texts.at(-1)).toContain("long task");
+      expect(scripted.texts.at(-1)).toContain("a.txt");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("starts a fresh conversation when an ongoing Opus 5.5 conversation moves to the fallback", async () => {
     scripted.queue = [CALL];
     await send("claude-opus", "long task");          // turn 1 served by Opus 5.5
@@ -1098,6 +1227,133 @@ describe("Priority access (Opus 5.5, Sonnet 5.5): OutOfCredits, remembering it, 
     expect(scripted.models).toEqual([]);
     scripted.queue = [CALL];
     expect((await send("claude-opus", "opus task")).status).toBe(200);
+  });
+});
+
+describe("client-scoped model fallback", () => {
+  const options = { fallbackModel: "gpt-6-think-deeper" };
+  const tools = [{ type: "function", function: { name: "bash", parameters: { type: "object", properties: { command: { type: "string" } } } } }];
+  const unavailable = { fullText: "", result: { value: "InternalError", errorCode: "BotConnection" } };
+  const call = { fullText: "```bash\nls\n```" };
+  function body(model = "claude-opus-4.8", stream = false) {
+    return ChatCompletionRequest.parse({
+      model, stream, tools,
+      messages: [{ role: "system", content: "sys" }, { role: "user", content: "client fallback fixture" }],
+    });
+  }
+
+  beforeEach(() => {
+    scripted.result = null;
+    scripted.fullText = undefined;
+    scripted.deltas = [];
+    scripted.queue = [];
+    scripted.texts = [];
+    scripted.models = [];
+    scripted.agentFlags = [];
+    scripted.newConversations = 0;
+  });
+  afterEach(() => {
+    scripted.queue = [];
+    scripted.result = null;
+    delete process.env.M365_OPUS_FALLBACK_MODEL;
+  });
+
+  it("replays full history to GPT-6, keeps it for tool follow-ups, and retries Opus in a new session", async () => {
+    const pool = new SessionPool();
+    const opening = body();
+    scripted.queue = [unavailable, call, { fullText: "Done." }, { fullText: "Primary again." }];
+    const first = await (await handleChatCompletion(opening, pool, options)).json();
+    expect(first.model).toBe("gpt-6-think-deeper");
+    expect(first.choices[0].message.tool_calls).toHaveLength(1);
+    expect(scripted.newConversations).toBe(1);
+    expect(scripted.agentFlags).toEqual([true, false]);
+    expect(scripted.texts[1]).toContain("client fallback fixture");
+    expect(scripted.texts[1]).toContain("empty InternalError");
+    const calls = first.choices[0].message.tool_calls;
+    const continuation = ChatCompletionRequest.parse({
+      ...opening,
+      messages: [
+        ...opening.messages,
+        { role: "assistant", content: null, tool_calls: calls },
+        { role: "tool", tool_call_id: calls[0].id, content: "a.txt" },
+      ],
+    });
+    const next = await (await handleChatCompletion(continuation, pool, options)).json();
+    expect(next.model).toBe("gpt-6-think-deeper");
+    expect(scripted.texts[2]).toContain("a.txt");
+    expect(scripted.texts[2]).not.toContain("client fallback fixture");
+    expect(scripted.texts[2]).toContain("unavailable in this conversation");
+    expect((await (await handleChatCompletion(opening, pool, options)).json()).model).toBe("claude-opus-4.8");
+    expect(scripted.models).toEqual(["claude-opus-4.8", "gpt-6-think-deeper", "gpt-6-think-deeper", "claude-opus-4.8"]);
+  });
+
+  it("honors the HTTP header for quota fallback and SSE metadata without changing other clients", async () => {
+    process.env.M365_OPUS_FALLBACK_MODEL = "claude-sonnet-4.6";
+    const refusal = "You've used your available priority access to the Opus model for today.";
+    scripted.queue = [{ fullText: refusal, result: { value: "OutOfCredits", message: refusal } }, call, call];
+    const app = createApp();
+    const request = (header: boolean, stream: boolean) => new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(header ? { "X-M365-Fallback-Model": options.fallbackModel } : {}) },
+      body: JSON.stringify(body("claude-opus-5.5", stream)),
+    });
+    const streamed = await app.fetch(request(true, true));
+    const chunks = (await streamed.text()).split("\n")
+      .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+      .map((line) => JSON.parse(line.slice(6)));
+    const toolChunks = chunks.filter((chunk) => chunk.choices?.[0]?.delta?.tool_calls);
+    expect(toolChunks).toHaveLength(1);
+    expect(toolChunks[0].model).toBe("gpt-6-think-deeper");
+    expect((await (await app.fetch(request(false, false))).json()).model).toBe("claude-sonnet-4.6");
+    expect(scripted.models).toEqual(["claude-opus-5.5", "gpt-6-think-deeper", "claude-sonnet-4.6"]);
+  });
+
+  it("remembers a model-specific OutOfCredits even when Opus 4.8 has no known metered budget", async () => {
+    const pool = new SessionPool();
+    scripted.queue = [{ fullText: "", result: { value: "OutOfCredits", message: "Out of credits." } }, call, call];
+    expect((await (await handleChatCompletion(body(), pool, options)).json()).model).toBe("gpt-6-think-deeper");
+    expect((await (await handleChatCompletion(body(), pool, options)).json()).model).toBe("gpt-6-think-deeper");
+    expect(scripted.models).toEqual(["claude-opus-4.8", "gpt-6-think-deeper", "gpt-6-think-deeper"]);
+  });
+
+  it.each(["gpt-6-astra", "claude-opus-5.5", ""])("rejects unknown, metered, or empty fallback IDs: %s", async (fallbackModel) => {
+    const res = await createApp().fetch(new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-M365-Fallback-Model": fallbackModel },
+      body: JSON.stringify(body()),
+    }));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.param).toBe("X-M365-Fallback-Model");
+    expect(scripted.models).toEqual([]);
+  });
+
+  it("does not switch between aliases for the same upstream route", async () => {
+    scripted.result = unavailable.result;
+    const res = await respond(body(), { fallbackModel: "claude-opus-4.5" });
+    expect(res.status).toBe(502);
+    expect(scripted.models.length).toBeGreaterThan(0);
+    expect(scripted.models.every((model) => model === "claude-opus-4.8")).toBe(true);
+  });
+
+  it.each([
+    { turn: { ...unavailable, messageType: "Disengaged" }, status: 502 },
+    { turn: { fullText: "", result: { value: "Throttled", errorCode: "PerUserThrottled" } }, status: 429 },
+    { turn: { fullText: "Approval is required before running this." }, status: 200 },
+  ])("does not change models for safety, account throttling, or an approval response: $status", async ({ turn, status }) => {
+    scripted.queue = [turn];
+    const res = await handleChatCompletion(ChatCompletionRequest.parse({
+      model: "claude-opus-4.8", stream: false, messages: [{ role: "user", content: "hello" }],
+    }), new SessionPool(), options);
+    expect(res.status).toBe(status);
+    expect(scripted.models).toEqual(["claude-opus-4.8"]);
+  });
+
+  it("does not cascade to a third model if the configured fallback is also exhausted", async () => {
+    process.env.M365_OPUS_FALLBACK_MODEL = "claude-sonnet-4.6";
+    scripted.queue = [unavailable, { fullText: "", result: { value: "OutOfCredits", message: "Out of credits." } }];
+    const res = await handleChatCompletion(body(), new SessionPool(), options);
+    expect(res.status).toBe(429);
+    expect(scripted.models).toEqual(["claude-opus-4.8", "gpt-6-think-deeper"]);
   });
 });
 

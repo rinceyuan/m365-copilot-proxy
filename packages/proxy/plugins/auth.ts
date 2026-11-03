@@ -1,11 +1,15 @@
 import { getToken } from "@m365-copilot/core";
+import { getProxyBackend, getLlmApiAuthMode } from "@m365-copilot/proxy-lib";
 
 /**
- * Authenticate against M365 once, at server startup. A failure here throws and
- * aborts boot — the equivalent of the old binary's `process.exit(1)` on auth
- * failure, so the server never comes up half-broken.
+ * Sydney authenticates once at startup and aborts boot on failure.
+ * LLMAPI credentials are independent and supplied on each request.
  */
 export default defineNitroPlugin(async () => {
+  if (getProxyBackend() === "llmapi") {
+    console.log(`LLMAPI selected (${getLlmApiAuthMode()} authorization); Sydney authentication is disabled.`);
+    return;
+  }
   console.log("Authenticating...");
   try {
     await getToken();

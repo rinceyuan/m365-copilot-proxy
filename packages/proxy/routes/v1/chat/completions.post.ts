@@ -1,7 +1,10 @@
-import { ChatCompletionRequest, handleChatCompletion } from "@m365-copilot/proxy-lib";
+import { ChatCompletionRequest, getProxyBackend, handleChatCompletion } from "@m365-copilot/proxy-lib";
+import { handleLlmApiEvent } from "../../../llmapi-handler";
 import { pool } from "../../../server-pool";
 
 export default defineEventHandler(async (event) => {
+  if (getProxyBackend() === "llmapi") return handleLlmApiEvent(event);
+
   let body: ReturnType<typeof ChatCompletionRequest.parse>;
   try {
     body = ChatCompletionRequest.parse(await readBody(event));
@@ -29,5 +32,8 @@ export default defineEventHandler(async (event) => {
 
   // handleChatCompletion returns a Web Response (JSON or an SSE ReadableStream
   // when stream:true). Returning it directly lets h3 forward it untouched.
-  return handleChatCompletion(body, pool, { signal: ac.signal });
+  return handleChatCompletion(body, pool, {
+    signal: ac.signal,
+    fallbackModel: getHeader(event, "x-m365-fallback-model"),
+  });
 });

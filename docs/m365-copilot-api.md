@@ -28,6 +28,234 @@ If you read nothing else:
 
 ---
 
+## Local compatibility: per-client fallback (2026-11-02)
+
+The local Chat Completions endpoint accepts `X-M365-Fallback-Model`. This is a
+proxy extension, not an upstream M365 header. It must name an advertised,
+unmetered model; unknown IDs return 400 rather than taking the default tone.
+The header overrides the process-wide priority-access fallback for that client.
+Clients without it, including the Responses adapter, retain their existing policy.
+
+On explicit priority exhaustion, replay the full history in a fresh conversation.
+Also allow this opt-in fallback when a premium-only model returns a content-less
+`InternalError`, unless the turn disengaged or reached its conversation throttle.
+An availability fallback stays on that model for the conversation's following
+tool turns; a new conversation or changed requested model/policy retries the
+primary. A quota fallback still expires at the recorded reset. Never cascade
+through multiple fallbacks or switch models for safety refusals, account-wide
+throttling, tool permissions, or arbitrary network failures. JSON/SSE `model`
+identifies the model route that actually answered.
+
+The earlier SignalR-based `copilotm` installation requested `claude-opus-4.8`
+with fallback
+`gpt-6-think-deeper` (`Gpt_6_Reasoning`, separate from Sol). Neither the catalog
+nor the wire tone establishes the exact Astra deployment identity: do not
+invent a `gpt-6-astra` alias or claim physical-model verification from a marker
+response. Both existing routes passed sequential text inference. The current
+native installation below does not use this fallback.
+
+## Local compatibility: independent LLMAPI relay (2026-11-02)
+
+The local proxy also exposes `/llmapi/v1/models` (GET), and
+`/llmapi/v1/chat/completions`, `/llmapi/v1/responses`, `/llmapi/v1/messages` (POST).
+These relay to the matching routes under
+`https://loki.delve.office.com/api/v1/llmapi`. They do not use SignalR, the tool
+agent, prompt-emulated tools, Sydney authentication, or the legacy fallback.
+Existing `/v1/...` routes and client defaults are unchanged unless the operator
+explicitly selects `M365_BACKEND=llmapi`.
+
+Each caller must explicitly supply `Authorization: Bearer <authorized-token>`
+for LLMAPI. The reviewed upstream contract requires its own delegated resource
+permission and admitted application/workflow; a working Sydney login is not
+proof of that authorization. This independent relay does not read app-managed
+authorization; the optional selected-backend mode below is separate.
+Model IDs must come from this backend's discovery, not the SignalR catalog.
+
+The relay defaults `X-Llm-Api-Version` to `2026-09-22`. Supply a stable
+`X-ConversationId` to correlate turns; otherwise a UUID is generated.
+`X-ClientCallId`, API version, and Anthropic protocol headers are supported.
+The supplied desktop-style profile is now supported: `X-ClientScenario: Code`,
+`X-ClientType: Copilot`, and `X-ClientFeature: LlmApiProxy`. These three defaults
+can be overridden by the corresponding `M365_LLMAPI_CLIENT_SCENARIO`,
+`M365_LLMAPI_CLIENT_TYPE`, and `M365_LLMAPI_CLIENT_FEATURE` environment variables,
+or by caller headers when no environment override is set. Values must be
+1-128 printable ASCII characters. They are client metadata, not authorization.
+Arbitrary caller headers and internal scenario/model/moderation overrides are
+still not forwarded.
+
+Native JSON/SSE bodies and upstream errors, including 402/403/429 and retry
+guidance, are preserved without retries or cross-backend fallback. Redirects are
+rejected. Inference bodies are limited to 5 MiB (Chat/Responses) or 12 MiB
+(Messages). No claim that this route fixes Opus priority exhaustion is made;
+actual model access still needs separately authorized discovery and inference.
+
+### Opt-in native backend (2026-11-03)
+
+Set `M365_BACKEND=llmapi` before starting the server to route `/v1/models`,
+`/v1/chat/completions`, `/v1/responses`, and `/v1/messages` directly to LLMAPI.
+The default is `sydney`; unknown values fail startup instead of silently
+switching transports. Both the Nitro server and framework-free `createApp()`
+use the selector. Native mode skips Sydney startup login.
+
+With the default `M365_LLMAPI_AUTH=explicit`, each selected `/v1` request uses `M365_LLMAPI_TOKEN` when explicitly configured
+(a raw bearer token, without the `Bearer` prefix), otherwise its caller's
+`Authorization` header. The independent `/llmapi/v1` relay never borrows that
+server credential. Explicit mode does not read app-managed authorization or acquire a
+Sydney token for LLMAPI. Token acquisition, refresh and application admission
+must be arranged through an authorized identity. `/health` confirms listener
+readiness only, not upstream authorization.
+
+On Windows, `M365_LLMAPI_AUTH=app-managed` reads the current user's
+`undocked-anthropic` provider from the M365 Code profile. It opens SQLite
+read-only, checks the exact Loki destination and four stored metadata headers,
+and uses current-user DPAPI to recover the protected authorization in memory.
+It rereads the app state per request; it does not mint or independently refresh
+Microsoft credentials. Expired authorization returns 503 with
+`m365_authorization_expired`; open the app's Code session to let the app renew
+its own sign-in. Ambiguous profiles require `M365_LLMAPI_PROFILE`.
+
+App-managed routes require a separate local key, supplied in `x-api-key` or a
+bearer header. Configure `M365_LLMAPI_API_KEY_FILE` or
+`M365_LLMAPI_LOCAL_API_KEY` with a private, randomly generated key of at least
+32 printable characters. Protect the file for the current user and SYSTEM.
+`bin/llmapi-key.mjs` supports per-request client key commands without embedding
+Microsoft authorization in clients. Browser Origins and non-loopback hosts are
+rejected. The independent `/llmapi/v1` relay never borrows app authorization.
+
+The upstream paths are protocol-specific, not a uniform extra `/v1` prefix:
+
+| Local route | Loki path relative to `/api/v1/llmapi` |
+|---|---|
+| `/v1/models` | `/models` |
+| `/v1/messages` | `/v1/messages` |
+| `/v1/chat/completions` | `/chat/completions` |
+| `/v1/responses` | `/responses` |
+
+Claude's discovered `supported_endpoints` contains only `/v1/messages`;
+direct Chat/Responses calls return `endpoint_model_mismatch`. In app-managed
+mode the selected Claude Chat/Responses routes therefore translate once to
+native Messages before inference. Function, namespace and custom tools use
+native `tool_use`/`tool_result`, not prompt parsing. Reasoning effort maps to
+adaptive thinking and the unchanged `output_config.effort`. Responses carries
+signed native thinking in a tagged `reasoning.encrypted_content` string for
+stateless tool round trips. This carrier is base64 encoding, not encryption;
+it contains native signed reasoning blocks, not invented summaries. Compatible
+stream completion requires the real upstream `message_stop`; errors and
+truncation do not synthesize successful completion or trigger another model.
+
+Use native Anthropic `/messages` with an Anthropic client. Its `thinking`,
+`output_config.effort`, thinking signatures, tool definitions, `tool_use`,
+`tool_result`, and SSE events pass through without schema stripping, prompt
+framing, effort clamping, or synthetic terminal events. `/models` returns the
+upstream catalog and capability metadata, not the SignalR aliases or a
+hard-coded list of five effort levels. Clients must use exact discovered IDs
+and capabilities; absent metadata is unknown. The upstream still validates
+thinking/effort combinations and returns its own errors unchanged.
+For the tested Opus 5.5 route, omitted thinking and adaptive thinking succeeded;
+`thinking: {type: "disabled"}` was rejected with `invalid_body`. Do not infer
+that a `none` effort is supported from the five advertised effort levels.
+
+For an Anthropic SDK that appends `/v1/messages`, use the listener root as its
+base URL in selected native mode, or `/llmapi` for the independent relay.
+Do not append a second `/v1` through an OpenAI-style base URL.
+
+For a separate Copilot CLI launcher, keep provider settings process-local with
+`setlocal`: use `COPILOT_PROVIDER_TYPE=anthropic`, set
+`COPILOT_PROVIDER_BASE_URL` to the listener root, and configure
+`COPILOT_PROVIDER_API_KEY_COMMAND` to run the local key helper. Pass
+`--model claude-opus-5.5 --reasoning-effort high` before forwarded arguments.
+This keeps the ordinary `copilot` provider and shared configuration unchanged;
+it does not clamp effort for other clients.
+
+Validation on November 3: library and Nitro builds and 288 affected regression
+tests passed, including authorization boundaries, native transport and compatible
+reasoning/tool round trips. The full suite also exposed two unchanged Windows
+path-assumption failures in log/benchmark tests.
+The native runtime's `anthropic` to `undocked-anthropic` selection and header
+builder were statically observed. A metadata-only, read-only SQLite projection
+from one local Code profile independently confirmed the provider, Loki endpoint,
+all four supplied header values, and exactly these five registered models:
+`claude-opus-5`, `claude-opus-5.5`, `claude-sonnet-5`, `claude-sonnet-5.5`, and
+`claude-haiku-5.5`. Every entry registers `low`, `medium`, `high`, `xhigh`, and
+`max`; all `max_prompt_tokens` and `max_output_tokens` fields are NULL.
+That metadata-only projection did not return or decrypt protected authorization. It verifies stored
+configuration, not live outbound requests, upstream discovery, supported
+thinking/effort combinations, token limits or entitlement. Do not infer a 1M
+context or fixed output budget from client configuration or fallback values.
+
+Subsequent app-managed live verification successfully read current-user
+authorization after the app refreshed its session. Loki `/models` returned
+10 entries, including all five supplied Claude IDs, with all five effort levels
+and an advertised `max_context_window_tokens` of 1,000,000. This is upstream
+capability metadata, not a million-token execution test or an output limit.
+Native `/v1/messages` returned HTTP 200, model `claude-opus-5.5`, and the exact
+requested marker. The installed native server also passed authenticated
+discovery and rejected an unauthenticated caller with 401.
+Sequential acceptance passed native Messages JSON/SSE, Chat and Responses
+JSON, Responses SSE completion, a real native tool-result round trip and all
+five effort values (one sample per case). This establishes acceptance, not
+comparative reasoning performance. The simple tool sample returned no thinking
+block or signature; signed-thinking preservation is verified with unit fixtures,
+not observed live generation.
+
+The actual installed Copilot CLI executed successful `view` and `powershell`
+calls and, with its documented autopilot mode, a successful `task_complete`.
+Codex executed a PowerShell read through the native Responses adapter.
+The scoped `copilotm` default is Opus 5.5 with high effort, not max. Resuming an
+existing session recorded `reasoningEffort: high` and returned the exact marker.
+Existing approval, sandbox and shared-home settings were not changed.
+
+A later resumed-session failure was classified by the CLI as `content_filter`
+on the Anthropic Messages path, despite high effort. One telemetry sample
+reported 155,704 input and six output tokens; repeated refused turns provided no
+tool progress, so autopilot stopped. This is not a successful long-task sample.
+A local mock protocol comparison showed that empty `end_turn` does not display
+the filtering notice, while `refusal` does. A fresh real high-effort request
+succeeded. The retained diagnostics do not identify the exact model/gateway
+policy or triggering context; do not infer a specific blocked category or
+modify moderation headers to make the request pass.
+
+Seven subsequent local-only protocol controls (n=1 per variant) reproduced the
+notice only with `refusal`, not normal text, empty `end_turn`, a stream cut after
+`message_start`, a cut after `message_delta`, an SSE error, or thinking-only
+`end_turn`. The installed CLI did not display the synthetic refusal category
+even when `stop_details` supplied one. These controls narrow client behaviour;
+they are not captured evidence of the original upstream refusal category.
+The affected session's events and read-only database inspection did not recover
+an original native response.
+
+For upstream Messages diagnostics, enable the existing `M365_DEBUG` logger and
+set `M365_LOG_FILE` to a private path. Do not enable `M365_TRACE` to investigate
+this issue. A generated `X-M365-Proxy-Request-Id` correlates the response with
+HTTP status, upstream request ID, native stop reason, optional refusal category,
+token counts and observed stream termination. The bounded SSE observer preserves
+every response byte and propagates errors/cancellation; it does not retry,
+replace a refusal or synthesize a completion. It does not record prompts,
+response text, reasoning, signatures, tool arguments/results, authorization or
+the refusal explanation. Non-streamed bodies are not inspected. A missing
+category remains unknown rather than being inferred from token counts.
+The local installation now enables these metadata-only diagnostics; a fresh
+real native stream and CLI request both passed at high effort after deployment.
+
+Additional benign context controls passed with the installed CLI's system and
+tool configuration preserved (n=1 per control). A fresh 89-tool request accepted
+219,028 input tokens. An owned session switched from GitHub Sol/max back to
+native Opus/high accepted 219,195 tokens. A 91-tool autopilot check also completed
+real `view`, `powershell` and `task_complete` executions.
+The first controls inserted synthetic reference data at a temporary test relay.
+A separate stdin control then supplied that data through the real CLI itself:
+its two native tool turns accepted 221,752 and 222,137 input tokens, and session
+events confirmed all three tool executions succeeded with the fixture nonce.
+No historical user conversation was replayed. These are minimal read-only
+checks, not a general long-task benchmark; they show that context length,
+ordinary cross-provider resumption and autopilot alone are not sufficient to
+reproduce the reported failure. The specific old-history trigger remains unknown.
+
+Earlier OAuth attempts using the existing proxy and Azure CLI clients returned
+`AADSTS65002` for the tested resource/scope; this does not establish that every
+valid Loki authorization path is unavailable. Those attempts are not a
+prerequisite for the working app-managed path.
+
 ## 1. The endpoint
 
 ```
@@ -84,7 +312,8 @@ The `nativeclient` redirect URI is designed to be **intercepted by an embedded n
 ### Automated login quirks (Playwright)
 - The converged AAD login page keeps **hidden duplicate `<input type=password>` nodes**; a naive `fill()` can target a stale hidden one and submit an empty password. Fill the **visible** `name=`-selected field and verify the value landed (`fillVerified()`).
 - Field selectors: email `input[name="loginfmt"]`, password `input[name="passwd"]`, TOTP `input[name="otc"]`.
-- On NixOS, Playwright's bundled `chrome-headless-shell` fails (`libglib-2.0.so.0`); point it at a system Chromium via `CHROMIUM_PATH` (`resolveChromiumPath()`).
+- Both login paths default to Playwright's `msedge` channel on Windows. `CHROMIUM_PATH` overrides the browser on every platform.
+- On NixOS, Playwright's bundled `chrome-headless-shell` fails (`libglib-2.0.so.0`); point it at a system Chromium via `CHROMIUM_PATH` (`resolveBrowserOptions()`).
 - TOTP codes are single-use per 30s window — space retries past the window.
 
 ---

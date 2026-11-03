@@ -44,6 +44,7 @@ export const ChatMessage = z.object({
   tool_calls: z.array(ToolCall).optional(),
   tool_call_id: z.string().optional(),
   name: z.string().optional(),
+  reasoning_details: z.array(z.record(z.string(), z.unknown())).optional(),
 });
 
 export const ChatCompletionRequest = z.object({
@@ -58,6 +59,11 @@ export const ChatCompletionRequest = z.object({
   stream_options: z.object({ include_usage: z.boolean().optional() }).optional(),
   temperature: z.number().optional(),
   max_tokens: z.number().optional(),
+  max_completion_tokens: z.number().optional(),
+  reasoning_effort: z.string().optional(),
+  parallel_tool_calls: z.boolean().optional(),
+  top_p: z.number().optional(),
+  stop: z.union([z.string(), z.array(z.string())]).optional(),
   tools: z.array(ToolDefinition).optional(),
   tool_choice: z.union([
     z.enum(["auto", "none", "required"]),

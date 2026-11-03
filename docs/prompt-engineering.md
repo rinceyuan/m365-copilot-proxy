@@ -47,6 +47,22 @@ These are what actually move compliance. In rough order of importance:
    the next turn when only its first call ran. See
    [`tool-calling.md`](tool-calling.md), [hyp §20 F39, F41].
 
+## Terminal harness contracts
+
+Copilot CLI can supply `view`, `powershell`, and `task_complete`. Its `view` is
+not M365's identically named sandbox tool. When `task_complete` is declared, keep
+the current terminal tool inventory and completion template on every upstream
+turn, including deltas and retries. The relay's ordinary prose-only ending must
+not contradict that completion contract. This is transport metadata, not
+permission to skip unfinished work or manufacture a completion call.
+
+Recognize multi-parameter `powershell`/`pwsh` tools as shells and retain the
+schema's required argument names in templates. A shell's `command: ...` field in
+the header is its argument, not a command beginning with the literal `command:`.
+An explicit blank separator still starts a verbatim body; file contents remain
+unchanged. The terminal's normal permission and path checks apply, and
+`tool_choice: "none"` must not advertise local execution.
+
 ## Claude Sonnet: don't *cage* it, don't *label* things `<system>`
 
 Everything above was learned on models with no tools of their own. Sonnet 5 (`Claude_Sonnet` on

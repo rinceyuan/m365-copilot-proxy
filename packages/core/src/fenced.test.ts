@@ -364,6 +364,74 @@ describe("shell routing (Tier 1)", () => {
     expect(findShellTool([readFile, writeFile])).toBeUndefined();
   });
 
+  it("recognizes Copilot's multi-parameter PowerShell tool and routes Windows fences to it", () => {
+    const copilotShell: ToolDef = {
+      type: "function",
+      function: {
+        name: "powershell",
+        parameters: {
+          type: "object",
+          properties: {
+            command: { type: "string" },
+            description: { type: "string" },
+            shellId: { type: "string" },
+          },
+          required: ["command", "description"],
+        },
+      },
+    };
+    expect(findShellTool([copilotShell, readFile])).toBe(copilotShell);
+    expect(hostPlatformNote(findShellTool([copilotShell]), "win32")).toContain("runs PowerShell");
+    const { calls } = parseFencedToolCalls(
+      "```pwsh\ndescription: Read the nonce\n\nGet-Content nonce.txt\n```",
+      buildSpecMap([copilotShell]),
+    );
+    expect(calls[0]?.function.name).toBe("powershell");
+    expect(JSON.parse(calls[0].function.arguments)).toEqual({
+      description: "Read the nonce",
+      command: "Get-Content nonce.txt",
+    });
+  });
+
+  it.each([
+    "description: Read the nonce\ncommand: Get-Content nonce.txt",
+    "command: Get-Content nonce.txt\ndescription: Read the nonce",
+    "command: |-\n  Get-Content nonce.txt\ndescription: Read the nonce",
+  ])("reads a named shell command as an argument rather than executable header text: %s", (inner) => {
+    const shell: ToolDef = {
+      type: "function",
+      function: {
+        name: "powershell",
+        parameters: {
+          properties: { command: { type: "string" }, description: { type: "string" } },
+          required: ["command"],
+        },
+      },
+    };
+    const { calls } = parseFencedToolCalls("```powershell\n" + inner + "\n```", buildSpecMap([shell]));
+    expect(JSON.parse(calls[0].function.arguments)).toEqual({
+      command: "Get-Content nonce.txt",
+      description: "Read the nonce",
+    });
+    expect(formatFencedToolDefinitions([shell], "relay")).toContain("Required arguments: command.");
+  });
+
+  it("preserves command-like text after the explicit body separator", () => {
+    const shell: ToolDef = {
+      function: { name: "powershell", parameters: {
+        properties: { command: { type: "string" }, description: { type: "string" } },
+      } },
+    };
+    const command = "command: literal text\nWrite-Output done";
+    const rendered = renderFencedCall(deriveFencedSpec(shell), { description: "Keep the exact script", command });
+    const { calls } = parseFencedToolCalls(rendered, buildSpecMap([shell]));
+    expect(JSON.parse(calls[0].function.arguments).command).toBe(command);
+    const { calls: writes } = parseFencedToolCalls(
+      "```write_file\npath: data.yml\ncontent: literal text\n```", buildSpecMap([writeFile]),
+    );
+    expect(JSON.parse(writes[0].function.arguments).content).toBe("content: literal text");
+  });
+
   it("routes a ```bash block to a differently-named shell tool", () => {
     const specs = buildSpecMap([runCommand, readFile]);
     const { calls } = parseFencedToolCalls("```bash\nsed -i 's/a/b/' f.py\n```", specs);
@@ -595,6 +663,30 @@ describe("formatFencedToolDefinitions", () => {
     // Stresses the action-not-illustration contract
     expect(out).toContain("ACTION");
     expect(out).toContain("PRIMARY JOB");
+  });
+
+  it("uses the supplied completion tool instead of telling Claude to finish in prose", () => {
+    const complete: ToolDef = {
+      type: "function",
+      function: {
+        name: "task_complete",
+        description: "Finish the verified task and return its result.",
+        parameters: {
+          type: "object",
+          properties: { summary: { type: "string" } },
+          required: ["summary"],
+        },
+      },
+    };
+    for (const variant of ["relay", "relay_batch"]) {
+      const out = formatFencedToolDefinitions([bash, readFile, complete], variant);
+      expect(out).not.toContain("When the task is complete, tell me in a sentence instead of sending a block.");
+      expect(out).toContain("task_complete");
+      expect(out).toContain("requested work and checks are complete");
+      expect(out).toContain("```task_complete");
+    }
+    expect(formatFencedToolDefinitions([bash, readFile], "relay"))
+      .toContain("When the task is complete, tell me in a sentence instead of sending a block.");
   });
 });
 

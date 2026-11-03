@@ -8,6 +8,7 @@ import {
 import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import type { LaunchOptions } from "playwright";
 
 const CLIENT_ID = "c0ab8ce9-e9a0-42e7-b064-33d422df41f1";
 const AUTHORITY = "https://login.microsoftonline.com/common";
@@ -142,13 +143,12 @@ interface Credentials {
 }
 
 /**
- * Resolve a usable Chromium executable. Playwright's bundled chrome-headless-shell
- * is not patched for NixOS (fails on libglib-2.0.so.0), so prefer an explicit
- * CHROMIUM_PATH, then a system chromium on PATH. Returns undefined to let
- * Playwright use its bundled browser (works on patched/standard distros).
+ * Prefer CHROMIUM_PATH, then Edge on Windows or a system Chromium elsewhere.
+ * The system-browser fallback is needed on NixOS, where the bundled browser fails.
  */
-function resolveChromiumPath(): string | undefined {
-  if (process.env.CHROMIUM_PATH) return process.env.CHROMIUM_PATH;
+function resolveBrowserOptions(): Pick<LaunchOptions, "channel" | "executablePath"> {
+  if (process.env.CHROMIUM_PATH) return { executablePath: process.env.CHROMIUM_PATH };
+  if (process.platform === "win32") return { channel: "msedge" };
   for (const bin of ["chromium", "chromium-browser", "google-chrome", "chrome"]) {
     try {
       const found = execSync(`command -v ${bin}`, { stdio: ["ignore", "pipe", "ignore"] })
@@ -156,13 +156,13 @@ function resolveChromiumPath(): string | undefined {
         .trim();
       if (found) {
         log.info(`Resolved system browser: ${found}`);
-        return found;
+        return { executablePath: found };
       }
     } catch {
       // not on PATH, try next
     }
   }
-  return undefined;
+  return {};
 }
 
 async function capture(page: any, label: string): Promise<void> {
@@ -339,7 +339,7 @@ async function runBrowserLogin(
     // coherent Linux Chrome UA instead of the default `HeadlessChrome` string.
     const context = await chromium.launchPersistentContext(BROWSER_PROFILE_DIR, {
       headless: true,
-      executablePath: resolveChromiumPath(),
+      ...resolveBrowserOptions(),
       args: [
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -491,7 +491,7 @@ async function loginInteractiveForScopes(scopes: string[]): Promise<string> {
 
   const context = await chromium.launchPersistentContext(BROWSER_PROFILE_DIR, {
     headless: false, // the entire point: a human has to see and drive this
-    executablePath: resolveChromiumPath(),
+    ...resolveBrowserOptions(),
     args: [
       "--no-sandbox",
       "--disable-dev-shm-usage",

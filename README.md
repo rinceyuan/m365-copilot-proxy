@@ -8,10 +8,32 @@ Use Microsoft 365 Copilot as an LLM backend for OpenAI-compatible coding agents 
 
 M365 Copilot uses a SignalR WebSocket protocol, not the OpenAI API. This project translates between the two:
 
-1. **Standalone proxy** — HTTP server with `/v1/chat/completions` and `/v1/models` endpoints. Works with any OpenAI-compatible client (pi, OpenClaw, etc.).
+1. **Standalone proxy** — HTTP server with `/v1/chat/completions`, `/v1/responses`, and `/v1/models` endpoints. Supports Chat Completions clients and Codex's Responses API.
 2. **OpenClaw plugin** — Config generator + setup CLI for OpenClaw's provider system.
 
-### Tool calling
+An independent local LLMAPI relay is also available at `/llmapi/v1` for
+`models`, `chat/completions`, `responses`, and native Anthropic `messages`.
+It requires an explicitly supplied bearer token authorized for that backend;
+the existing Sydney login and client defaults are not reused or changed.
+Upstream permissions, quota failures, and retry guidance remain enforced.
+Opt in with `M365_BACKEND=llmapi` to serve the same native protocols under
+`/v1`, including Anthropic `/v1/messages`, without Sydney startup authentication.
+Use a caller bearer or an explicitly configured `M365_LLMAPI_TOKEN` for those
+selected `/v1` routes. On Windows, `M365_LLMAPI_AUTH=app-managed` instead reads
+the current user's protected M365 Code provider using read-only SQLite and
+Windows DPAPI. Configure a separate private local client key with
+`M365_LLMAPI_API_KEY_FILE`; clients never receive the Microsoft authorization.
+The M365 app, not this proxy, renews its sign-in. Multiple initialized profiles
+require an explicit `M365_LLMAPI_PROFILE`.
+
+Native Anthropic Messages preserve thinking, effort, signatures, tools, results,
+and SSE. In app-managed mode, Claude Chat Completions and Responses requests
+are translated to that same model's native Messages endpoint, not ChatHub or a
+fallback model. `/models` exposes the actual upstream catalog and capabilities.
+The separate `/llmapi/v1` relay remains caller-bearer-only.
+See the [local LLMAPI contract](docs/m365-copilot-api.md#local-compatibility-independent-llmapi-relay-2026-11-02).
+
+### Tool calling (default SignalR backend)
 
 M365 Copilot doesn't support OpenAI-style `tool_calls` natively. Instead, tools are
 emulated via a **Markdown-fence format** (the JSON `{"tool":...}` format was removed —
@@ -256,6 +278,37 @@ Proxy conversations use M365 **temporary-chat mode by default**
 the Copilot history sidebar while multi-turn context still works for the live
 conversation. Set `M365_SAVE_HISTORY=1` before starting the proxy only if you
 deliberately want proxy chats saved in Copilot history.
+
+### Use with Codex
+
+With Codex 0.162.1, start `m365-proxy 4141`, then create
+`~/.codex/m365.config.toml`. This named profile leaves your default provider unchanged:
+
+```toml
+model = "gpt-6.1-sol"
+model_provider = "m365"
+
+[model_providers.m365]
+name = "M365 Copilot"
+base_url = "http://127.0.0.1:4141/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+```
+
+```sh
+codex --profile m365
+```
+
+`POST /v1/responses` translates full input histories, input images, function calls,
+custom tools, namespaces, and Codex's inline `additional_tools` declarations
+through the existing chat handler. Streaming uses Responses lifecycle events,
+including tool arguments and failures. Tools still execute in Codex, with its
+existing approvals and sandbox policy.
+
+This is a stateless compatibility endpoint: send the complete history with
+`store:false`. Server-side `previous_response_id`, background jobs, hosted tools
+(such as `web_search`), and WebSocket transport are not supported.
 
 ### 6. Run on NixOS (systemd service)
 

@@ -12,6 +12,80 @@ Findings should carry **n** (sample size), **service version under test**,
 and **falsification criteria** wherever they're claiming something stronger
 than "we eyeballed one run." See §M (Methods) for the experimental rig.
 
+## Local compatibility experiment: native LLMAPI (2026-11-03)
+
+**Hypothesis:** the desktop Code provider is a separate native Anthropic
+transport; ChatHub's tone/framing constraints do not establish its capabilities.
+**Prediction:** the provider selects Anthropic independently, preserves native
+thinking/effort/tools and streams, and discovers its own catalog.
+**Falsification:** reject this integration as verified if authorized discovery,
+inference or a complete native tool round fails, regardless of local health.
+
+**Evidence:** static Code runtime 0.1.417.0 observation
+`ev_909a8d728c402e18c33b44db47c2b90c57bb9daa47cd9f3247710d4d77541d16`
+links `anthropic` to `undocked-anthropic` and the four client/version headers.
+A separate metadata-only SQLite projection (read-only transaction, n=1 local
+profile) confirmed the provider, endpoint, all four stored header values and
+exactly the five supplied Claude model IDs. Each registers all five effort
+levels; input/output limit columns are NULL. No protected authorization was
+returned or decrypted. Stored registration is not captured execution or proof
+of upstream discovery, token limits, supported effort combinations or admission.
+288 affected regressions pass, including native payload/capability preservation,
+local client authentication and compatible signed-thinking/tool round trips.
+Two normal OAuth-client attempts returned `AADSTS65002` for the tested
+resource/scope (n=1 per client); neither is a successful live inference sample.
+The supplied reference uses app-managed current-user DPAPI authorization,
+not independent OAuth. After normal Code navigation renewed the app's session,
+the new provider implementation successfully loaded authorization in memory.
+Live Loki `/models` returned 10 entries, all five supplied Claude IDs, the five
+efforts, and advertised 1M context limits; only `/v1/messages` is supported for
+these Claude models. A native Opus 5.5 request returned HTTP 200 and the exact
+marker. Direct OpenAI endpoints rejected that model, so app-managed compatibility
+translates Claude Chat/Responses to native Messages without model fallback.
+The installed server passed authenticated discovery and local key enforcement.
+Sequential installed acceptance also passed native Messages, Chat/Responses,
+SSE completion, a real native tool-result round trip and all five effort values
+(n=1 per case). Copilot CLI executed `view`, `powershell` and, in autopilot mode,
+`task_complete`; Codex executed a real PowerShell read through Responses.
+The scoped `copilotm` launcher now defaults to Opus 5.5 with high effort;
+resuming an existing session recorded `reasoningEffort: high` and succeeded.
+The simple native tool sample did not return thinking or a signature. Signed
+thinking preservation is covered by unit fixtures, not observed live generation.
+**Subsequent real-session limitation:** a resumed Opus 5.5 session already set
+to high effort recorded `content_filter` on the Anthropic `/v1/messages` path
+(155,704 input tokens, six output tokens in one retained telemetry sample).
+Repeated no-tool turns stopped autopilot. A local mock comparison reproduced
+the exact filtering notice with native `refusal`, but not with an empty
+`end_turn`; the normal text control also passed. The client emitted adaptive
+thinking and `output_config.effort: high` in these local requests.
+A fresh real high-effort request still returned its exact marker.
+These observations distinguish the notice from a generic empty completion;
+they do not identify which historical content, model policy or gateway rule
+caused the refusal. The original raw upstream frame was not retained.
+**Follow-up:** seven local protocol controls (n=1 each) also ruled out the tested
+truncation, SSE-error and thinking-only cases as reproductions of that notice.
+Only the refusal fixture displayed it; its supplied category was not shown by
+the CLI. A read-only check of failure-window session events and the session
+database found no retained original response. Native Messages now has opt-in,
+bounded, metadata-only SSE diagnostics through the existing debug logger,
+without response rewriting, history replay or moderation changes. After enabling
+it on the local service, fresh real native SSE and CLI controls passed with high
+effort, and the log contained correlation/stop metadata but not fixture text or
+the local client key. This establishes observability, not the original refusal's
+category; a future refusal must actually supply `stop_details` to reveal one.
+**Long-context controls:** fresh CLI with 89 tools accepted 219,028 tokens;
+an owned GitHub Sol/max to native Opus/high resumption accepted 219,195.
+Large-context autopilot with 91 tools executed real fixture reads and completion.
+These initial controls inserted benign data in a temporary relay, so a separate
+real-stdin control was required: it accepted 221,752 then 222,137 tokens and
+recorded successful `view`, `powershell` and `task_complete` events with the
+actual fixture nonce. All cases used high native effort (n=1 per control).
+The controls did not replay the failed history or exercise historical signed
+thinking; they do not prove every long session works. Context size, ordinary
+model switching or autopilot by themselves did not reproduce the refusal.
+Do not export Microsoft credentials or claim advertised budgets were executed.
+See the [native backend contract](m365-copilot-api.md#opt-in-native-backend-2026-11-03).
+
 **Contents**
 
 - §M — Methods (rig, raw-data pointers, caveats, falsification criteria)

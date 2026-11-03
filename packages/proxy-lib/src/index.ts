@@ -1,8 +1,12 @@
 import { type ModelSessionOptions, getAvailableModels } from "@m365-copilot/core";
 import { ChatCompletionRequest } from "./schemas.js";
 import { SessionPool, handleChatCompletion } from "./handler.js";
+import { ResponsesRequest, handleResponses } from "./responses.js";
+import { getProxyBackend, getLlmApiAuthMode, handleLlmApiRequest, handleSelectedLlmApiRequest } from "./llmapi.js";
 
 export { SessionPool, handleChatCompletion } from "./handler.js";
+export { ResponsesRequest, handleResponses } from "./responses.js";
+export { getProxyBackend, getLlmApiAuthMode, handleLlmApiRequest, handleSelectedLlmApiRequest, type LlmApiOptions } from "./llmapi.js";
 export { ChatCompletionRequest, ChatMessage, ToolCall, ToolDefinition } from "./schemas.js";
 
 // Re-export tool utilities from core
@@ -35,7 +39,7 @@ const CONTEXT_WINDOW_TOKENS = Number(process.env.M365_CONTEXT_WINDOW) || 1_000_0
 const MAX_OUTPUT_TOKENS = Number(process.env.M365_MAX_OUTPUT_TOKENS) || 1_000_000;
 
 /** Build the OpenAI-compatible `GET /v1/models` payload. */
-export function buildModelsPayload() {
+export function buildModelsPayload(codexClient = false) {
   const created = Math.floor(Date.now() / 1000);
   return {
     object: "list",
@@ -52,6 +56,9 @@ export function buildModelsPayload() {
       max_input_tokens: CONTEXT_WINDOW_TOKENS,
       max_output_tokens: MAX_OUTPUT_TOKENS,
     })),
+    // Codex catalogs require model-owned instructions. An empty catalog keeps
+    // its bundled instructions instead of replacing them with proxy prompts.
+    ...(codexClient ? { models: [] } : {}),
   };
 }
 
@@ -60,7 +67,7 @@ export function buildModelsPayload() {
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-M365-Fallback-Model, X-Llm-Api-Version, X-ConversationId, X-ClientCallId, X-ClientScenario, X-ClientType, X-ClientFeature, Anthropic-Version, Anthropic-Beta",
 };
 
 function withCors(res: Response): Response {
@@ -90,22 +97,32 @@ export interface FetchApp {
  * whose routes reuse the same `handleChatCompletion` / `buildModelsPayload` helpers.
  */
 export function createApp(sessionOptions: ModelSessionOptions = {}): FetchApp {
+  const backend = getProxyBackend();
+  if (backend === "llmapi") getLlmApiAuthMode();
   const pool = new SessionPool(sessionOptions);
 
   async function fetch(req: Request): Promise<Response> {
-    const { pathname } = new URL(req.url);
+    const { pathname, searchParams } = new URL(req.url);
     const method = req.method.toUpperCase();
 
     if (method === "OPTIONS") {
       return withCors(new Response(null, { status: 204 }));
     }
 
+    if (pathname.startsWith("/llmapi/")) {
+      return withCors(await handleLlmApiRequest(req));
+    }
+
     if (method === "GET" && pathname === "/health") {
       return withCors(json(200, HEALTH_PAYLOAD));
     }
 
+    if (backend === "llmapi" && pathname.startsWith("/v1/")) {
+      return withCors(await handleSelectedLlmApiRequest(req));
+    }
+
     if (method === "GET" && pathname === "/v1/models") {
-      return withCors(json(200, buildModelsPayload()));
+      return withCors(json(200, buildModelsPayload(searchParams.has("client_version"))));
     }
 
     if (method === "POST" && pathname === "/v1/chat/completions") {
@@ -118,7 +135,20 @@ export function createApp(sessionOptions: ModelSessionOptions = {}): FetchApp {
         );
       }
       // req.signal aborts when the client disconnects → cancels the M365 turn.
-      return withCors(await handleChatCompletion(body, pool, { signal: req.signal }));
+      return withCors(await handleChatCompletion(body, pool, {
+        signal: req.signal,
+        fallbackModel: req.headers.get("X-M365-Fallback-Model") ?? undefined,
+      }));
+    }
+
+    if (method === "POST" && pathname === "/v1/responses") {
+      let body: ReturnType<typeof ResponsesRequest.parse>;
+      try {
+        body = ResponsesRequest.parse(await req.json());
+      } catch (err: any) {
+        return withCors(json(400, { error: { message: err.message, type: "invalid_request_error" } }));
+      }
+      return withCors(await handleResponses(body, pool, { signal: req.signal }));
     }
 
     return withCors(
