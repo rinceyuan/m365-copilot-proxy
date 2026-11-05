@@ -1,0 +1,80 @@
+{
+  "verified_date": "2026-11-03",
+  "repository": "https://github.com/rinceyuan/m365-copilot-proxy",
+  "branch": "main",
+  "verified_commit": "93372d4234f3b8d2a4d076efcf4fabffb52935d4",
+  "upstream_base_commit": "65905e881d6597040966aff9b087aa9a908b358a",
+  "patch_required": false,
+  "node": "24.22.2",
+  "pnpm": "10.32.1",
+  "koffi": "3.2.1",
+  "github_copilot_cli": "1.0.105",
+  "codex_cli": "0.166.0",
+  "proxy": {
+    "host": "127.0.0.1",
+    "port": 4141,
+    "backend": "llmapi",
+    "auth": "app-managed",
+    "upstream": "https://loki.delve.office.com/api/v1/llmapi",
+    "provider": "undocked-anthropic",
+    "api_version": "2026-09-22",
+    "client_metadata": {
+      "X-ClientScenario": "Code",
+      "X-ClientType": "Copilot",
+      "X-ClientFeature": "LlmApiProxy"
+    },
+    "startup_task": "M365 Native Proxy 4141",
+    "diagnostics": "metadata-only (M365_DEBUG, no M365_TRACE)"
+  },
+  "live_catalog": {
+    "count": 10,
+    "anthropic_messages_only": ["claude-opus-5.5", "claude-opus-5", "claude-sonnet-5.5", "claude-sonnet-5", "claude-haiku-5.5"],
+    "openai_responses_only": ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna", "gpt-61-sol"],
+    "claude_efforts": ["low", "medium", "high", "xhigh", "max"],
+    "gpt_efforts": "none..max (gpt-61-sol: low..max)",
+    "advertised_context": "1M Claude, 1.05M GPT (metadata, not capacity-tested)"
+  },
+  "clients": {
+    "copilotm": {
+      "default_model": "claude-opus-5.5",
+      "default_reasoning_effort": "high",
+      "claude_route": "anthropic -> /v1/messages",
+      "other_route": "openai responses -> /v1/responses",
+      "entry_points": ["copilotm.ps1 (PowerShell)", "copilotm.cmd (cmd)", "copilotm.mjs (routing)"]
+    },
+    "codex": {
+      "model": "claude-opus-5.5",
+      "reasoning_effort": "medium",
+      "wire_api": "responses",
+      "env_key": "M365_PROXY_API_KEY"
+    },
+    "vscode": {
+      "version": "1.144.1",
+      "provider": "M365",
+      "vendor": "customendpoint",
+      "claude": "apiType messages -> /v1/messages, effort format messages",
+      "gpt": "apiType responses -> /v1/responses, statefulResponses false",
+      "api_key": "VS Code secret storage (${input:...}), never in the file"
+    }
+  },
+  "verified": {
+    "affected_tests": "75 passed (llmapi 47, compat 6, responses 22)",
+    "catalog_script_tests": "5 passed",
+    "vscode_merge_script_tests": "3 passed",
+    "vscode_shaped_tool_round_trip": ["claude-opus-5.5 (messages)", "gpt-61-sol (responses)"],
+    "opus55_all_efforts": true,
+    "opus55_long_context_autopilot_tokens": 222137,
+    "opus55_real_tools": ["view", "powershell", "task_complete"],
+    "codex_gpt_models_text": ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna", "gpt-61-sol"],
+    "copilotm_models_text": ["claude-opus-5.5", "claude-sonnet-5.5", "gpt-61-sol", "gpt-6-luna", "gpt-5.6-sol"],
+    "copilotm_gpt_view_tool": "gpt-61-sol",
+    "cross_model_resume": "claude-opus-5.5 -> gpt-61-sol -> claude-opus-5.5 (nonce recalled)",
+    "startup_task_cold_start": true,
+    "live_signed_thinking_round_trip_observed": false
+  },
+  "known_issues": [
+    "Original resumed-session content_filter refusal category unknown",
+    "gpt-6-sol intermittent upstream capacity errors",
+    "BYOK protocol fixed per process; cross-family switch requires --resume --model"
+  ]
+}
