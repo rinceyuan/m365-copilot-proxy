@@ -29,6 +29,8 @@ When `NODE_USE_ENV_PROXY=1` and `HTTP_PROXY=http://127.0.0.1:7897` are set uncon
    - **Unreachable (`DIRECT` mode)**: Routes outbound requests directly without a proxy so `/v1/models` and all GPT models continue working when Clash Verge is closed.
 3. If Clash Verge closes mid-window and a proxied `fetch()` throws `ECONNREFUSED` or `ECONNRESET`, it immediately invalidates the probe cache, switches to `DIRECT`, and retries the request once.
 
+The probed address defaults to `127.0.0.1:7897` and can be overridden with `M365_AUTO_PROXY_HOST` and `M365_AUTO_PROXY_PORT`.
+
 ## Clash Verge & Windows WAM (`Microsoft.AAD.BrokerPlugin`) Coexistence
 
 When running Clash Verge on Windows with System Proxy enabled (`ProxyEnable = 1`):

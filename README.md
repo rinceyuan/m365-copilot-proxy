@@ -2,6 +2,8 @@
 
 Use Microsoft 365 Copilot as an LLM backend for OpenAI-compatible coding agents like [pi](https://pi.dev/) and [OpenClaw](https://docs.openclaw.ai/). Wraps M365 Copilot's WebSocket/SignalR API in an OpenAI-compatible interface with tool calling support.
 
+> **About this fork.** [`rinceyuan/m365-copilot-proxy`](https://github.com/rinceyuan/m365-copilot-proxy) tracks [`cramt/m365-copilot-proxy`](https://github.com/cramt/m365-copilot-proxy) and adds a Windows setup for the native M365 LLMAPI backend: app-managed authorization, logon/auth-guard scheduled tasks, automatic proxy/direct egress, a `copilotm` wrapper for GitHub Copilot CLI, Codex and VS Code BYOK helpers, and a reusable agent skill. See [Windows Native LLMAPI Setup](#7-windows-native-llmapi-setup-app-managed-auth-copilotm-codex--vs-code-byok), [`scripts/windows/`](scripts/windows/README.md) and [`skill/`](skill/README.md).
+
 > **Want the gory protocol details?** See [docs/m365-copilot-api.md](docs/m365-copilot-api.md) — a full write-up of M365 Copilot's undocumented WebSocket API: auth, SignalR frames, tones/models, throttling, the "Disengaged" filter, and the Copilot Studio agent trick that makes tool calling work.
 
 ## How it works
@@ -101,7 +103,7 @@ Each agent session reuses the same M365 conversation (same `sessionId` + `conver
 ### 1. Install
 
 ```sh
-git clone https://github.com/cramt/m365-copilot-proxy
+git clone https://github.com/rinceyuan/m365-copilot-proxy   # or upstream: cramt/m365-copilot-proxy
 cd m365-copilot-proxy
 pnpm install
 pnpm build
@@ -354,9 +356,10 @@ without NixOS: `nix run github:cramt/m365-copilot-proxy -- 4141`.
 On Windows, the proxy can run directly against M365's native LLMAPI (`https://loki.delve.office.com/api/v1/llmapi`) using **app-managed authorization** (`M365_BACKEND=llmapi`, `M365_LLMAPI_AUTH=app-managed`) without Playwright login or `secrets.json`:
 
 - **App-managed authorization**: Reads the current user's protected M365 Copilot desktop app (`Code` profile) credentials per request via read-only SQLite + Windows DPAPI. Clients authenticate to `http://127.0.0.1:4141` using a separate random local client key (`%LOCALAPPDATA%\m365-copilot-proxy\.state\llmapi\client-key`).
-- **Dynamic `PROXY` ↔ `DIRECT` auto-egress (`m365-proxy-auto-egress.cjs`)**: Probes the local Clash Verge proxy (`127.0.0.1:7897`) before outbound `fetch()` calls and switches Undici's dispatcher on the fly without restarting `m365-proxy`:
-  - **Clash Verge open (`PROXY`)**: Routes `loki.delve.office.com` through `127.0.0.1:7897` so all **10 native models** (5 Claude + 5 GPT) are available, while bypassing Microsoft login/WAM (`Microsoft.AAD.BrokerPlugin`) domains (`DIRECT`) so Windows SSO, Git Credential Manager, and Azure CLI remain unaffected.
-  - **Clash Verge closed (`DIRECT`)**: Automatically falls back to direct outbound connections (the 5 GPT models remain available; regional Claude models return `403 model_not_allowed` until Clash Verge is opened again).
+- **Dynamic `PROXY` ↔ `DIRECT` auto-egress (`m365-proxy-auto-egress.cjs`)**: A `--require` preload that probes the local proxy (`127.0.0.1:7897`, 150 ms timeout, cached 2 s) before outbound `fetch()` calls and switches Undici's dispatcher on the fly without restarting `m365-proxy`:
+  - **Local proxy reachable (`PROXY`)**: Upstream LLMAPI traffic goes through `127.0.0.1:7897`, so all **10 native models** (5 Claude + 5 GPT) are available in regions where Claude is not served directly.
+  - **Local proxy closed (`DIRECT`)**: Falls back to direct connections, including a single retry when the proxy disappears mid-request. The 5 GPT models remain available; Claude models may return `403 model_not_allowed` until the proxy is back.
+  - **Clash Verge + Windows sign-in**: Keep Microsoft login domains out of the system proxy and route only `loki.delve.office.com` through it, otherwise WAM (`Microsoft.AAD.BrokerPlugin`) fails with `NoNetwork`. The exact bypass list and rules are in [`scripts/windows/README.md`](scripts/windows/README.md#clash-verge--windows-wam-microsoftaadbrokerplugin-coexistence).
 - **Windows launchers & background tasks ([`scripts/windows/`](scripts/windows/README.md))**:
   - `m365-proxy.cmd` & `m365-proxy-autostart.vbs`: Logon scheduled task (`M365 Native Proxy 4141`) running headless on `127.0.0.1:4141`.
   - `m365-proxy-auth-guard.mjs` & `install-auth-guard.ps1`: Scheduled task (`M365 Proxy Authorization Guard`) that checks `/v1/models` every 5 minutes and opens the M365 Copilot desktop app (with a 1-hour cooldown) when `m365_authorization_expired` is detected.
@@ -699,10 +702,11 @@ Three token scopes are acquired:
 | `M365_BACKEND` | Set to `llmapi` to serve native LLMAPI routes (`/v1/models`, `/v1/messages`, `/v1/responses`, `/v1/chat/completions`) without Sydney startup login |
 | `M365_LLMAPI_AUTH` | Set to `app-managed` on Windows to read the current user's M365 Copilot desktop app `Code` profile authorization via read-only SQLite + DPAPI |
 | `M365_LLMAPI_API_KEY_FILE` | Path to the private local client API key file required by `/v1/*` when `M365_LLMAPI_AUTH=app-managed` |
-| `M365_LLMAPI_PROFILE` | Explicit M365 Copilot desktop app profile name (e.g. `Code`) when multiple profiles exist |
-| `M365_LLMAPI_PROVIDER` | Upstream LLMAPI provider header (`X-Llm-Provider`, default `undocked-anthropic`) |
-| `M365_LLMAPI_BASE_URL` | Upstream LLMAPI base URL (default `https://loki.delve.office.com/api/v1/llmapi`) |
-| `M365_PROXY_AUTO_EGRESS_URL` | Local proxy URL probed by `m365-proxy-auto-egress.cjs` (default `http://127.0.0.1:7897`) for dynamic `PROXY` ↔ `DIRECT` switching |
+| `M365_LLMAPI_PROFILE` | Explicit M365 Copilot desktop app profile name when multiple initialized profiles exist |
+| `M365_LLMAPI_LOCAL_API_KEY` | Inline local client API key (at least 32 printable characters); takes precedence over `M365_LLMAPI_API_KEY_FILE` |
+| `M365_LLMAPI_TOKEN` | Explicit LLMAPI bearer token used by `/v1/*` when `M365_LLMAPI_AUTH=explicit` (the default) |
+| `M365_LLMAPI_CLIENT_SCENARIO` / `M365_LLMAPI_CLIENT_TYPE` / `M365_LLMAPI_CLIENT_FEATURE` | Override the upstream `X-ClientScenario` / `X-ClientType` / `X-ClientFeature` headers (defaults `Code` / `Copilot` / `LlmApiProxy`) |
+| `M365_AUTO_PROXY_HOST` / `M365_AUTO_PROXY_PORT` | Local proxy probed by the Windows `m365-proxy-auto-egress.cjs` preload for dynamic `PROXY` ↔ `DIRECT` switching (defaults `127.0.0.1` / `7897`) |
 
 ### Usage / context-window % in responses
 
