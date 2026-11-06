@@ -356,6 +356,28 @@ without NixOS: `nix run github:cramt/m365-copilot-proxy -- 4141`.
 On Windows, the proxy can run directly against M365's native LLMAPI (`https://loki.delve.office.com/api/v1/llmapi`) using **app-managed authorization** (`M365_BACKEND=llmapi`, `M365_LLMAPI_AUTH=app-managed`) without Playwright login or `secrets.json`:
 
 - **App-managed authorization**: Reads the current user's protected M365 Copilot desktop app (`Code` profile) credentials per request via read-only SQLite + Windows DPAPI. Clients authenticate to `http://127.0.0.1:4141` using a separate random local client key (`%LOCALAPPDATA%\m365-copilot-proxy\.state\llmapi\client-key`).
+
+#### Prerequisite: Code mode in the M365 Copilot app
+
+App-managed mode reuses the sign-in of the **Code** mode (Claude Code session) in the Microsoft 365 Copilot desktop app. The proxy never signs in, refreshes, exports or logs Microsoft credentials itself.
+
+1. Install the Microsoft 365 Copilot desktop app on Windows and sign in with your work or school account.
+2. Switch the app to **Code** mode and start a Claude Code session once. This creates the `Code` provider in `%LOCALAPPDATA%\Microsoft\Copilot\User Data\CopilotCodingHome\<profile>\data.db`.
+3. Start the proxy (`m365-proxy.cmd`, or the `M365 Native Proxy 4141` scheduled task). Each request reads that provider read-only, checks it targets the `undocked-anthropic` provider at `https://loki.delve.office.com/api/v1/llmapi`, decrypts the authorization in memory with current-user DPAPI, and forwards it with the stored client headers (`X-ClientScenario: Code`, `X-ClientType: Copilot`, `X-ClientFeature: LlmApiProxy`).
+4. Keep the app installed and signed in. It renews its own Code sign-in; when that lapses, reopen the app in Code mode.
+
+| Error code (HTTP 503 unless noted) | Meaning | Fix |
+|---|---|---|
+| `m365_provider_unavailable` / `m365_authorization_unavailable` | Code mode was never initialized, or Windows could not read the protected authorization | Open the M365 Copilot app, switch to **Code** and start a session |
+| `m365_authorization_expired` | The Code sign-in stored by the app has expired | Reopen the app in **Code** mode so it renews the sign-in (the optional authorization guard opens the app for you, at most once an hour) |
+| `m365_profile_ambiguous` | More than one initialized Code profile exists | Set `M365_LLMAPI_PROFILE` to the profile folder name |
+| `m365_profile_unavailable` | `M365_LLMAPI_PROFILE` names a missing profile | Fix or unset `M365_LLMAPI_PROFILE` |
+| `m365_platform_unsupported` | App-managed mode was enabled on a non-Windows host | Use `M365_LLMAPI_AUTH=explicit` with `M365_LLMAPI_TOKEN` instead |
+| `llmapi_local_key_required` | The proxy has no local client key (at least 32 printable characters) | Create the key file referenced by `M365_LLMAPI_API_KEY_FILE` |
+| `llmapi_local_auth_required` (401) | The client sent no key or the wrong key | Pass the local key as `x-api-key` or `Authorization: Bearer` |
+| `llmapi_local_only` (403) | The request came from a browser (`Origin` header) or a non-loopback host | Call the proxy from a local CLI/app via `127.0.0.1` or `localhost` |
+
+Other OAuth clients (for example Azure CLI) are rejected by this resource with `AADSTS65002`, so Code mode in the M365 Copilot app is the only supported source of LLMAPI authorization on Windows.
 - **Dynamic `PROXY` ↔ `DIRECT` auto-egress (`m365-proxy-auto-egress.cjs`)**: A `--require` preload that probes the local proxy (`127.0.0.1:7897`, 150 ms timeout, cached 2 s) before outbound `fetch()` calls and switches Undici's dispatcher on the fly without restarting `m365-proxy`:
   - **Local proxy reachable (`PROXY`)**: Upstream LLMAPI traffic goes through `127.0.0.1:7897`, so all **10 native models** (5 Claude + 5 GPT) are available in regions where Claude is not served directly.
   - **Local proxy closed (`DIRECT`)**: Falls back to direct connections, including a single retry when the proxy disappears mid-request. The 5 GPT models remain available; Claude models may return `403 model_not_allowed` until the proxy is back.
